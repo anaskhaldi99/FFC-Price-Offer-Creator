@@ -17,31 +17,16 @@ st.set_page_config(
 )
 
 
-def process_catalog(file_buffer, codes_str, discount_input):
-    """Parses product codes and prepares data for both Word (truncated price)
-
-    and Excel (exact two-decimal list price and customer price).
-    """
+def fetch_base_products(file_buffer, codes_str):
+    """Fetches base product details and list prices from the 'Old to New' sheet."""
     code_list = [
         code.strip() for code in codes_str.split(",") if code.strip()
     ]
 
-    try:
-        discount_pct = float(discount_input) if discount_input.strip() else 0.0
-    except ValueError:
-        discount_pct = 0.0
-
     df = pd.read_excel(file_buffer, sheet_name="Old to New")
     df.columns = df.columns.str.strip()
 
-    word_results = []
-    excel_results = []
-
-    discount_str = (
-        f"{int(discount_pct)}%"
-        if discount_pct.is_integer()
-        else f"{discount_pct}%"
-    )
+    base_results = []
 
     for idx, code in enumerate(code_list, start=1):
         row = df[df["PRODUCT CODE"].astype(str).str.strip() == str(code)]
@@ -75,65 +60,77 @@ def process_catalog(file_buffer, codes_str, discount_input):
             except (ValueError, TypeError):
                 list_price = 0.0
 
-            if discount_pct > 0:
-                customer_price = list_price * (1.0 - (discount_pct / 100.0))
-            else:
-                customer_price = list_price
-
-            # Word Data (Truncated price to whole integer)
-            word_results.append(
+            base_results.append(
                 {
                     "SR NO.": idx,
                     "PRODUCT CODE": int(code) if code.isdigit() else code,
                     "PRODUCT NAME": product_name,
                     "PRODUCT DETAILS": product_details,
                     "GENDER": gender,
-                    "PRICE/KG ($)": int(customer_price),
-                }
-            )
-
-            # Excel Data (Exact unrounded two-decimal floats)
-            excel_results.append(
-                {
-                    "serial no.": idx,
-                    "product code": int(code) if code.isdigit() else code,
-                    "product name": product_name,
-                    "product details": product_details,
-                    "gender": gender,
-                    "list price in usd": round(list_price, 2),
-                    "customer price in usd": round(customer_price, 2),
-                    "discount": discount_str,
+                    "LIST PRICE USD": list_price,
+                    "FOUND": True,
                 }
             )
         else:
-            word_results.append(
+            base_results.append(
                 {
                     "SR NO.": idx,
                     "PRODUCT CODE": code,
                     "PRODUCT NAME": "NOT FOUND",
                     "PRODUCT DETAILS": "-",
                     "GENDER": "-",
-                    "PRICE/KG ($)": 0,
-                }
-            )
-            excel_results.append(
-                {
-                    "serial no.": idx,
-                    "product code": code,
-                    "product name": "NOT FOUND",
-                    "product details": "-",
-                    "gender": "-",
-                    "list price in usd": 0.00,
-                    "customer price in usd": 0.00,
-                    "discount": discount_str,
+                    "LIST PRICE USD": 0.0,
+                    "FOUND": False,
                 }
             )
 
-    return (
-        pd.DataFrame(word_results),
-        pd.DataFrame(excel_results),
-        discount_pct,
-    )
+    return pd.DataFrame(base_results)
+
+
+def apply_discounts_and_build_dfs(base_df, discounts_list):
+    """Applies per-row discounts and builds final DataFrames for Word and Excel."""
+    word_results = []
+    excel_results = []
+
+    for idx, row in base_df.iterrows():
+        disc_pct = discounts_list[idx]
+        discount_str = (
+            f"{int(disc_pct)}%" if disc_pct.is_integer() else f"{disc_pct}%"
+        )
+
+        list_price = row["LIST PRICE USD"]
+        if disc_pct > 0 and row["FOUND"]:
+            customer_price = list_price * (1.0 - (disc_pct / 100.0))
+        else:
+            customer_price = list_price
+
+        # Word Data (Truncated price to whole integer)
+        word_results.append(
+            {
+                "SR NO.": row["SR NO."],
+                "PRODUCT CODE": row["PRODUCT CODE"],
+                "PRODUCT NAME": row["PRODUCT NAME"],
+                "PRODUCT DETAILS": row["PRODUCT DETAILS"],
+                "GENDER": row["GENDER"],
+                "PRICE/KG ($)": int(customer_price) if row["FOUND"] else 0,
+            }
+        )
+
+        # Excel Data (Exact unrounded two-decimal floats)
+        excel_results.append(
+            {
+                "serial no.": row["SR NO."],
+                "product code": row["PRODUCT CODE"],
+                "product name": row["PRODUCT NAME"],
+                "product details": row["PRODUCT DETAILS"],
+                "gender": row["GENDER"],
+                "list price in usd": round(list_price, 2),
+                "customer price in usd": round(customer_price, 2),
+                "discount": discount_str,
+            }
+        )
+
+    return pd.DataFrame(word_results), pd.DataFrame(excel_results)
 
 
 def generate_excel_file(df_excel):
@@ -251,9 +248,26 @@ def update_word_document(
     return doc_io
 
 
+def parse_discount_val(val_str):
+    """Safely converts a string discount input to a float (blank = 0.0)."""
+    if not val_str or not str(val_str).strip():
+        return 0.0
+    try:
+        return float(str(val_str).replace("%", "").strip())
+    except ValueError:
+        return 0.0
+
+
 # --- STREAMLIT UI ---
 st.title("📋 Price Offer Generator")
 
+# Initialize session states
+if "base_fetched" not in st.session_state:
+    st.session_state.base_fetched = False
+if "files_generated" not in st.session_state:
+    st.session_state.files_generated = False
+
+# --- STEP 1: PRODUCT & CUSTOMER INPUTS ---
 uploaded_file = st.file_uploader(
     "Upload Catalog Excel File (Kütüphane.xlsx)", type=["xlsx"]
 )
@@ -271,15 +285,7 @@ codes_input = st.text_input(
     placeholder="e.g. 100416, 100419, 100421",
 )
 
-discount_input = st.text_input(
-    "Discount % (Optional)", placeholder="e.g. 5 (leave blank for no discount)"
-)
-
-# Handle output state persistence across reruns
-if "processed" not in st.session_state:
-    st.session_state.processed = False
-
-if st.button("Generate Price Offer", type="primary"):
+if st.button("1. Fetch Products & Preview Prices", type="primary"):
     if not uploaded_file:
         st.error("⚠️ Please upload the Excel file before proceeding.")
     elif not customer_name.strip():
@@ -292,14 +298,79 @@ if st.button("Generate Price Offer", type="primary"):
         )
     else:
         try:
-            word_df, excel_df, discount_pct = process_catalog(
-                uploaded_file, codes_input, discount_input
+            base_df = fetch_base_products(uploaded_file, codes_input)
+            st.session_state.base_df = base_df
+            st.session_state.saved_customer_name = customer_name.strip()
+            st.session_state.saved_customer_address = customer_address.strip()
+            st.session_state.base_fetched = True
+            st.session_state.files_generated = (
+                False  # Reset final files when new products are fetched
+            )
+        except Exception as e:
+            st.error(f"An error occurred while reading the Excel file: {e}")
+
+# --- STEP 2: PREVIEW & DISCOUNT SELECTION ---
+if st.session_state.base_fetched:
+    st.divider()
+    st.subheader("🔍 Product Preview (Base List Prices)")
+
+    preview_display = st.session_state.base_df.drop(columns=["FOUND"]).copy()
+    preview_display["LIST PRICE USD"] = preview_display[
+        "LIST PRICE USD"
+    ].map(lambda x: f"{x:.2f}")
+    st.dataframe(preview_display, use_container_width=True, hide_index=True)
+
+    st.subheader("🏷️ Apply Discounts")
+    discount_mode = st.radio(
+        "Choose how you want to apply discounts:",
+        options=[
+            "Apply One Discount to All Products",
+            "Apply Individual Discounts per Product",
+        ],
+        horizontal=True,
+    )
+
+    discounts_to_apply = []
+
+    if discount_mode == "Apply One Discount to All Products":
+        global_disc_input = st.text_input(
+            "Discount % for All Products (Leave blank for 0%)",
+            placeholder="e.g. 10",
+            key="global_disc_box",
+        )
+        global_disc_val = parse_discount_val(global_disc_input)
+        discounts_to_apply = [global_disc_val] * len(st.session_state.base_df)
+
+    else:
+        st.caption(
+            "Enter a discount percentage for each product below (leave blank for 0%):"
+        )
+        for idx, row in st.session_state.base_df.iterrows():
+            col_info, col_input = st.columns([3, 1])
+            with col_info:
+                st.markdown(
+                    f"**{row['SR NO.']}. [{row['PRODUCT CODE']}] {row['PRODUCT NAME']}** "
+                    f"— List Price: `${row['LIST PRICE USD']:.2f}`"
+                )
+            with col_input:
+                indiv_input = st.text_input(
+                    f"Discount % ({row['PRODUCT CODE']})",
+                    placeholder="0%",
+                    label_visibility="collapsed",
+                    key=f"indiv_disc_{idx}_{row['PRODUCT CODE']}",
+                )
+                discounts_to_apply.append(parse_discount_val(indiv_input))
+
+    if st.button("2. Generate Word & Excel Files", type="primary"):
+        try:
+            word_df, excel_df = apply_discounts_and_build_dfs(
+                st.session_state.base_df, discounts_to_apply
             )
 
             now = datetime.now()
             date_str = f"{now.day}/{now.month}/{now.year}"
 
-            clean_cust_name = customer_name.strip().upper()
+            clean_cust_name = st.session_state.saved_customer_name.upper()
             base_filename = (
                 f"{clean_cust_name} PRICE OFFER {now.day}-{now.month}-{now.year}"
             )
@@ -307,21 +378,20 @@ if st.button("Generate Price Offer", type="primary"):
             template_filename = "template.docx"
             word_file = update_word_document(
                 template_filename,
-                customer_name,
-                customer_address,
+                st.session_state.saved_customer_name,
+                st.session_state.saved_customer_address,
                 date_str,
                 word_df,
             )
             excel_file = generate_excel_file(excel_df)
 
-            # Store in session state to prevent UI resetting on download click
+            # Store in session state so download buttons persist
             st.session_state.word_df = word_df
             st.session_state.excel_df = excel_df
-            st.session_state.discount_pct = discount_pct
             st.session_state.base_filename = base_filename
             st.session_state.word_file_data = word_file.getvalue()
             st.session_state.excel_file_data = excel_file.getvalue()
-            st.session_state.processed = True
+            st.session_state.files_generated = True
 
         except FileNotFoundError:
             st.error(
@@ -330,20 +400,26 @@ if st.button("Generate Price Offer", type="primary"):
         except Exception as e:
             st.error(f"An error occurred: {e}")
 
-# Render results and download buttons persistently
-if st.session_state.processed:
-    st.subheader("📋 Output Preview")
-    if st.session_state.discount_pct > 0:
-        st.info(f"Discount Applied: **{st.session_state.discount_pct}%**")
+# --- STEP 3: FINAL PREVIEW & PERSISTENT DOWNLOAD BUTTONS ---
+if st.session_state.files_generated:
+    st.divider()
+    st.subheader("📋 Final Output Preview")
 
-    st.write("**Word Table Preview:**")
+    st.write("**Word Table Preview (Truncated Prices):**")
     st.dataframe(
         st.session_state.word_df, use_container_width=True, hide_index=True
     )
 
-    st.write("**Excel Sheet Preview:**")
+    st.write("**Excel Sheet Preview (Exact Two-Decimal Prices):**")
+    excel_preview_display = st.session_state.excel_df.copy()
+    excel_preview_display["list price in usd"] = excel_preview_display[
+        "list price in usd"
+    ].map(lambda x: f"{x:.2f}")
+    excel_preview_display["customer price in usd"] = excel_preview_display[
+        "customer price in usd"
+    ].map(lambda x: f"{x:.2f}")
     st.dataframe(
-        st.session_state.excel_df, use_container_width=True, hide_index=True
+        excel_preview_display, use_container_width=True, hide_index=True
     )
 
     st.subheader("📥 Downloads")
