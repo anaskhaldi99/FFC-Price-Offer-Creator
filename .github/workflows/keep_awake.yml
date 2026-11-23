@@ -4,14 +4,21 @@ on:
   schedule:
     # Runs automatically every 8 hours (00:00, 08:00, 16:00 UTC)
     - cron: '0 */8 * * *'
-  workflow_dispatch: # Allows you to run it manually anytime
+  workflow_dispatch: # Allows manual testing
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Set up Playwright
-        uses: microsoft/playwright-github-action@v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright and Chromium
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
 
       - name: Visit Streamlit App
         run: |
